@@ -1,3 +1,9 @@
+# About This Repository
+
+This is a fork of [MaxText](https://github.com/google/maxtext) modified to support sparse pre-training.
+
+For more information about our approach, please refer to our paper: [The Journey Matters: Average Parameter Count over Pre-training Unifies Sparse and Dense Scaling Laws](https://arxiv.org/abs/2501.12486)
+
 # Example Usage
 
 Below is an example script for running a Llama2-1B model training job:
@@ -17,11 +23,6 @@ python3 multihost_job.py --NUM_SLICES=$NODE_COUNT --RUN_NAME=$RUN_NAME --BUCKET_
 
 Make sure to replace the placeholder values with your actual project information before running the script.
 
-# About This Repository
-
-This is a fork of [MaxText](https://github.com/google/maxtext) modified to support sparse pre-training.
-
-For more information about our approach, please refer to our paper: [The Journey Matters: Average Parameter Count over Pre-training Unifies Sparse and Dense Scaling Laws](https://arxiv.org/abs/2501.12486)
 
 ```bibtex
 @inproceedings{
