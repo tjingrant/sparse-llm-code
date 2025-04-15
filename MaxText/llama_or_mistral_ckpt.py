@@ -52,8 +52,25 @@ import max_logging
 from train import save_checkpoint
 import checkpointing
 
-
 MODEL_PARAMS_DICT = {
+    "llama2-70m": {
+        "num_layers": 6,
+        "num_heads": 8,
+        "num_kv_heads": 8,
+        "dims_per_head": 64,
+        "base_emb_dim": 512,
+        "base_mlp_dim": 2048,
+        "vocab": 32000,
+    },
+    "llama2-1b": {
+        "num_layers": 4,
+        "num_heads": 32,
+        "num_kv_heads": 32,
+        "dims_per_head": 128,
+        "base_emb_dim": 4096,
+        "base_mlp_dim": 11008,
+        "vocab": 32000,
+    },
     "llama2-70b": {
         "num_layers": 80,
         "num_heads": 64,

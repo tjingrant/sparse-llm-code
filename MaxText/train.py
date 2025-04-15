@@ -193,6 +193,7 @@ def save_checkpoint(
     dataset_type="c4",
     data_iterator=None,
     config: Optional[pyconfig.config] = None,
+    force: bool = False,
 ) -> bool:
   """Wrapper for saving checkpoint."""
   if config and config.enable_checkpointing:
@@ -219,6 +220,7 @@ def save_checkpoint(
     return checkpoint_manager.save(
         step,
         args=orbax.checkpoint.args.PyTreeSave(item=state, save_args=save_args, ocdbt_target_data_file_size=chunk_byte_size),
+        force=force,
     )
 
   if dataset_type == "grain":
@@ -230,6 +232,7 @@ def save_checkpoint(
             ),
             iter=grain.PyGrainCheckpointSave(data_iterator.local_iterator),
         ),
+        force=force,
     )
   else:
     return checkpoint_manager.save(
@@ -239,6 +242,7 @@ def save_checkpoint(
                 item=state, save_args=save_args, ocdbt_target_data_file_size=chunk_byte_size
             )
         ),
+        force=force,
     )
 
 
@@ -326,6 +330,240 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   return loss, aux
 
 
+def calculate_per_step_sparsity(num_pruning_iterations, target_sparsity):
+  # Calculate the per-step sparsity required to reach a given 
+  # target sparsity after a number of iterations
+  per_step_sparsity = 1. - (1. - target_sparsity) ** (1. / num_pruning_iterations)
+  return per_step_sparsity
+
+
+def prune(state, percent_to_keep, structure, do_not_prune_kw, scoring_method):
+  """Prune the model parameters to a given sparsity level."""
+  assert structure in ["none", "2:4"], (
+      "Unsupported pruning structure: %s" % structure
+  )
+  assert scoring_method in ["magnitude", "random"], (
+      "Unsupported pruning scoring method: %s" % scoring_method
+  )
+
+  def collect_importance_score(params, structure, scoring_method, do_not_prune_kw, scope):
+    """Collect importance score of all prunable weights for determining
+
+    the global importance score cutoff for pruning.
+
+    Prunable weights are those that satisfy the following conditions:
+    1. The weight is a kernel (i.e. has 'kernel' in its name)
+    2. The weight is not masked out.
+    3. In the event of 2:4 structured pruning, the weight is not among the
+       top 2 weights magnitude-wise in each group of consecutive 4 weights.
+    """
+
+    all_scores = []
+    num_remaining = 0
+    param_items = list(params.items())
+    for name, param in param_items:
+      full_name = f"{scope}.{name}"
+      if isinstance(param, dict):
+        child_importance, child_num_remaining, child_params = collect_importance_score(
+            param, structure, scoring_method, do_not_prune_kw, full_name
+        )
+        all_scores.extend(child_importance)
+        num_remaining += child_num_remaining
+        params[name] = child_params
+      elif name.endswith("kernel"):
+        # If do_not_prune_kw prohibits pruning, skip to next param.
+        do_not_prune = (
+            True if do_not_prune_kw and do_not_prune_kw in full_name else False
+        )
+        if do_not_prune:
+          continue
+        mask_name = name.replace("kernel", "mask")
+        mask = params[mask_name]
+        if structure == "2:4":
+          assert scoring_method == "magnitude", (
+              "Unsupported scoring method for 2:4 structured pruning: %s"
+              % scoring_method
+          )
+          prunable_weights = jnp.multiply(mask, param)
+          prunable_weights = jnp.reshape(
+              prunable_weights,
+              (prunable_weights.size // 4, 4),
+          )
+          # Sort the weights in each group by magnitude and zero out the top 2
+          # because they cannot be pruned.
+          prunable_weights = jnp.sort(jnp.abs(prunable_weights), axis=-1)
+          prunable_weights = prunable_weights[:, 0:2]
+          all_scores.append(prunable_weights.flatten())
+          num_remaining += jnp.sum(mask)
+        elif structure == "none":
+          if scoring_method == "magnitude":
+            # Only take the weights that are not masked out
+            all_scores.append(
+                jnp.multiply(mask.flatten(), param.flatten())
+            )
+          elif scoring_method == "random":
+            # Assign random float from 0.1 to 1 to unmasked positions as their
+            # importance score. Masked positions will stay masked as they
+            # have a uniform importance score of 0.
+            mask = jnp.multiply(
+                mask,
+                jax.random.uniform(
+                    jax.random.PRNGKey(0),
+                    shape=mask.shape,
+                    minval=0.1,
+                    maxval=1.0,
+                ),
+            )
+            params[mask_name] = mask
+            all_scores.append(mask.flatten())
+          num_remaining += jnp.sum(mask)
+        else:
+          raise ValueError("Unsupported pruning structure: %s" % structure)
+    return all_scores, num_remaining, params
+
+  def apply_global_threshold(params, threshold, structure, scoring_method, do_not_prune_kw, scope):
+    """Apply the global threshold to each kernel tensor and store the mask."""
+    new_params = {}
+    for name, param in params.items():
+      full_name = f"{scope}.{name}"
+      if isinstance(param, dict):
+        new_params[name] = apply_global_threshold(
+            param, threshold, structure, scoring_method, do_not_prune_kw, full_name
+        )
+      else:
+        do_not_prune = (
+            True if do_not_prune_kw and do_not_prune_kw in full_name else False
+        )
+        if name.endswith("kernel") and not do_not_prune:
+          if structure == "2:4":
+            assert scoring_method == "magnitude", (
+                "Unsupported scoring method for 2:4 structured pruning: %s"
+                % scoring_method
+            )
+            # Create a mask that is 1 for weights that are:
+            #   - Above a global threshold OR
+            #   - Above a local threshold (i.e. in the top 2 weights in each
+            #     group of 4 weights)
+            # and 0 otherwise.
+            grouped_param = jnp.reshape(param, (param.size // 4, 4))
+            local_threshold = jnp.sort(jnp.abs(grouped_param), axis=-1)[:, 1]
+            local_threshold = jnp.expand_dims(local_threshold, axis=-1)
+            # Keep weights if they are above either global or local threshold.
+            combined_threshold = jnp.minimum(threshold, local_threshold)
+            prune_mask = jnp.abs(grouped_param) <= combined_threshold
+            grouped_mask = jnp.logical_not(prune_mask)
+            # sparsity = jnp.mean(grouped_mask)
+            # jax.debug.print("Sparsity {sparsity}", sparsity=sparsity)
+            mask = jnp.reshape(grouped_mask, param.shape).astype(param.dtype)
+            mask_name = name.replace("kernel", "mask")
+            prev_mask = params[mask_name]
+            new_params[mask_name] = prev_mask + mask - prev_mask
+          elif structure == "none":
+            mask_name = name.replace("kernel", "mask")
+            prev_mask = params[mask_name]
+            if scoring_method == "magnitude":
+              # Create a mask w/ 1 for weights above a threshold and 0 otherwise
+              mask = (jnp.abs(param) >= threshold).astype(param.dtype)
+              new_params[mask_name] = jnp.abs(mask * prev_mask)
+            elif scoring_method == "random":
+              # Unmasked positions have random importance score, masked ones 
+              # have zero scores. So update the mask to have 1s for weights 
+              # whose random score is above a threshold, and 0 otherwise.
+              new_params[mask_name] = (jnp.abs(prev_mask) >= threshold).astype(
+                  param.dtype
+              ) * prev_mask
+
+        # Copy other parameters unchanged
+        if not name.endswith("mask") or (name.endswith("mask") and do_not_prune):
+          # Ensure we don't overwrite existing masks
+          new_params[name] = param
+    return new_params
+
+  # Step 1: Collect all scores
+  root_scope = "root"
+  all_scores, _, params = collect_importance_score(
+      dict(state.params), structure, scoring_method, do_not_prune_kw, root_scope
+  )
+  # Concatenate all collected scores into a single array
+  all_scores_concat = jnp.concatenate(all_scores)
+
+  # Step 2: Determine the global threshold
+  if structure == "none":
+    num_elements_total = all_scores_concat.size
+    num_to_keep_remaining = int(percent_to_keep * num_elements_total)
+    threshold_idx = num_elements_total - num_to_keep_remaining
+  elif structure == "2:4":
+    num_unprunable = all_scores_concat.size  # Half of the weights cannot go.
+    num_elements_total = all_scores_concat.size + num_unprunable
+    assert percent_to_keep > 0.499, (
+        "percent_to_keep_remaining must be always >= 50% for 2:4 structured"
+        " pruning"
+    )
+    # Use ceiling to ensure we always make progress.
+    num_to_keep_remaining = math.ceil(
+        percent_to_keep * num_elements_total
+    )
+    threshold_idx = num_elements_total - num_to_keep_remaining
+    assert threshold_idx >= 0, "threshold_idx must be non-negative."
+    # threshold_idx = threshold_idx - num_unprunable
+    jax.debug.print(
+        "threshold_idx = {threshold_idx}, ", threshold_idx=threshold_idx
+    )
+  else:
+    raise ValueError("Unsupported pruning structure: %s" % structure)
+
+  sorted_magnitude = jnp.sort(jnp.abs(all_scores_concat), stable=False)
+  # Note that the following line does not work if there are 2^31 elements.
+  # XLA does not support int64 indexing.
+  global_threshold = sorted_magnitude[threshold_idx]
+
+  # Step 3: Apply the global threshold to each kernel tensor
+  root_scope = "root"
+  new_params = apply_global_threshold(
+      params, global_threshold, structure, scoring_method, do_not_prune_kw, root_scope
+  )
+
+  pruning_metrics = {
+      "pruning_debug/threshold_idx": threshold_idx,
+      "pruning_debug/global_threshold": global_threshold,
+      "pruning_debug/percent_to_keep_remaining": percent_to_keep,
+  }
+  # Return the new state with updated parameters and masks
+  return state.replace(params=new_params), pruning_metrics
+
+
+
+def zero_mask_grad(grads):
+  """Zeros out gradients for any tensor in the PyTree whose path ends with 'mask'."""
+
+  def zero_if_mask(path, value):
+    # Check if the path ends with 'mask'
+    if path[-1].key.endswith("mask"):
+      return jnp.zeros_like(value)
+    else:
+      return value
+
+  # Use tree_map to apply zeroing conditionally based on the path
+  new_grads = jax.tree_util.tree_map_with_path(zero_if_mask, grads, is_leaf=lambda x: isinstance(x, jnp.ndarray))
+  return new_grads
+
+def binarize_mask(params):
+  """Zeros out gradients for any tensor in the PyTree whose path ends with 'mask'."""
+
+  def binarize_if_mask(path, value):
+    # Check if the path ends with 'mask'
+    if path[-1].key.endswith("mask"):
+      return jnp.where(value > 0, 1.0, 0.0)
+    else:
+      return value
+
+  # Use tree_map to apply zeroing conditionally based on the path
+  new_params = jax.tree_util.tree_map_with_path(
+      binarize_if_mask, params, is_leaf=lambda x: isinstance(x, jnp.ndarray)
+  )
+  return new_params
+
+
 def train_step(model, config, state, data, dropout_rng):
   """
 
@@ -384,7 +622,27 @@ def train_step(model, config, state, data, dropout_rng):
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
   else:
     grads = raw_grads
+  
+  grads = zero_mask_grad(grads)
   new_state = state.apply_gradients(grads=grads)
+  new_param = binarize_mask(new_state.params)
+  new_state = new_state.replace(params=new_param)
+  
+  num_param = max_utils.count_parameters_pytree(new_state.params)
+  num_prunable = max_utils.count_prunable_parameters_pytree(new_state.params)
+  nnz_prunable = max_utils.count_nonzero_prunable_parameters_pytree(new_state.params)
+  if config.do_not_prune_kw:
+    num_prunable_kw = max_utils.count_prunable_kw_pytree(new_state.params, config.do_not_prune_kw)
+    nnz_prunable_kw = max_utils.count_nonzero_kw_pytree(new_state.params, config.do_not_prune_kw)
+    print(f"do_not_prune_kw = {config.do_not_prune_kw}, num_prunable_kw = {num_prunable_kw}, nnz_prunable_kw = {nnz_prunable_kw}")
+  else:
+    nnz_prunable_kw = 0
+    num_prunable_kw = 0
+
+  jax.debug.print("num_prunable = {num_prunable}, nnz_prunable = {nnz_prunable}", num_prunable=num_prunable, nnz_prunable=nnz_prunable)
+  density = nnz_prunable / num_prunable
+  jax.debug.print("density = {density}", density=density)
+
   metrics = {
       "scalar": {
           "learning/loss": loss,
@@ -393,6 +651,12 @@ def train_step(model, config, state, data, dropout_rng):
           "learning/grad_norm": max_utils.l2norm_pytree(grads),
           "learning/raw_grad_norm": max_utils.l2norm_pytree(raw_grads),
           "learning/param_norm": max_utils.l2norm_pytree(new_state.params),
+          "pruning/num_param": num_param,
+          "pruning/prunable": num_prunable - num_prunable_kw,
+          "pruning/nonzero_prunable": nnz_prunable - nnz_prunable_kw,
+          "pruning/density":  (nnz_prunable - nnz_prunable_kw) / (num_prunable - num_prunable_kw),
+          f"pruning/nnz_prunable_kw_{config.do_not_prune_kw}": nnz_prunable_kw,
+          f"pruning/num_prunable_kw_{config.do_not_prune_kw}": num_prunable_kw,
       },
       "scalars": {},
   }
@@ -666,6 +930,30 @@ def train_loop(config, state=None):
       # pylint: disable=not-callable
       nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
       record_goodput(recorder, config, recorder.record_step_start_time if recorder else None, step)
+
+      pruning_metrics = {}
+      with jax.spmd_mode("allow_all"):
+        if config.pruning_method == "one-shot":
+          # If in one-shot pruning mode, simply prune the model at step 0.
+          if step == 0:
+            raise NotImplementedError("One-shot pruning is not yet implemented.")
+            state, _ = prune(state, config.sparsity)
+        elif config.pruning_method == "global_gradual":
+          # If in GMP pruning mode, prune the model at a fixed frequency.
+          if (step >= config.gmp_start_step and
+              step <= config.gmp_end_step and
+              step % config.gmp_pruning_frequency == 0):
+            assert config.gmp_start_step <= config.gmp_end_step
+            assert (config.gmp_end_step - config.gmp_start_step) % config.gmp_pruning_frequency == 0
+            num_pruning_iterations = (config.gmp_end_step - config.gmp_start_step) // config.gmp_pruning_frequency + 1
+            per_step_sparsity = calculate_per_step_sparsity(num_pruning_iterations, config.sparsity)
+            current_pruning_iterations = (step - config.gmp_start_step) // config.gmp_pruning_frequency
+            percent_to_keep_remaining = (1. - per_step_sparsity) ** (current_pruning_iterations + 1)
+            print(f"Pruning at step {step} with percent_to_keep_remaining {percent_to_keep_remaining}")
+            state, pruning_metrics = prune(state, percent_to_keep_remaining, config.pruning_structure, config.do_not_prune_kw, config.pruning_score)
+        else:
+          raise ValueError(f"Unsupported pruning method: {config.pruning_method}")
+
       with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
         state, metrics = p_train_step(state, example_batch, nextrng)
 
@@ -686,7 +974,7 @@ def train_loop(config, state=None):
 
     write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step, config)
 
-    if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
+    if config.eval_interval > 0 and step > start_step and ((step + 1) % config.eval_interval == 0 or step == config.steps - 1):
       assert eval_data_iterator
       cumulative_eval_metrics = {
           "scalar": {
@@ -731,6 +1019,8 @@ def train_loop(config, state=None):
       prof.deactivate()
 
   if checkpoint_manager is not None:
+    if save_checkpoint(checkpoint_manager, int(config.steps), state, config.dataset_type, data_iterator, force=True):
+      max_logging.log(f"saved a final checkpoint at step {config.steps}")
     checkpoint_manager.wait_until_finished()
   write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, config.steps - 1, config)  # final step metrics
   max_utils.close_summary_writer(writer)

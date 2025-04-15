@@ -911,3 +911,94 @@ def print_system_information():
   max_logging.log(f"System Information: Jax Version: {jax.__version__}")
   max_logging.log(f"System Information: Jaxlib Version: {jax.lib.__version__}")
   max_logging.log(f"System Information: Jax Backend: {jax.lib.xla_bridge.get_backend().platform_version}")
+
+
+
+def count_nonzero_kw_pytree(x, keyword):
+  """ Count the number of non-zero prunable parameters in a pytree,
+  specifically targeting parameters under keys matching a specific keyword.
+  """
+  flattened = jax.tree_util.tree_flatten_with_path(x)[0]
+  def count_nonzero_if_keyword(path, value):
+    match = False
+    for key in path:
+      if keyword in key.key:
+        match = True
+        break
+    if match and path[-1].key == "mask":
+      return jnp.sum(value, dtype=jnp.float64)
+    else:
+      return 0.0
+  nonzero_counts = [
+      count_nonzero_if_keyword(path, value) for (path, value) in flattened
+  ]
+  return sum(nonzero_counts)
+
+
+def count_prunable_kw_pytree(x, keyword):
+  """ Count the number of prunable parameters in a pytree,
+  specifically targeting parameters under keys matching a specific keyword.
+  """
+  flattened = jax.tree_util.tree_flatten_with_path(x)[0]
+  def count_size_if_keyword(path, value):
+    match = False
+    for key in path:
+      if keyword in key.key:
+        match = True
+        break
+    if match and path[-1].key == "mask":
+      return value.size * 1.0
+    else:
+      return 0.0
+  total_sizes = [count_size_if_keyword(path, value) for (path, value) in flattened]
+  return sum(total_sizes)
+
+def count_parameters_pytree(x):
+  """Count the total number of prunable parameters in a pytree,
+  specifically targeting parameters under keys ending with 'kernel'."""
+
+  # Flatten the tree to get paths and values
+  flattened = jax.tree_util.tree_flatten_with_path(x)[0]
+  
+  # Define a function to count elements if the path doesn't end with 'mask'
+  def count_size_if_not_mask(path, value):
+    # Check if the last part of the path (accessed as the last DictKey's key) is 'mask'
+    if path[-1].key == 'mask':
+      return 0.0
+    return value.size * 1.0
+
+  # Apply the counting function to each element in the flattened structure
+  total_sizes = [count_size_if_not_mask(path, value) for (path, value) in flattened]
+  return sum(total_sizes)
+
+# Check the following against golden:
+# Check the following against golden:
+# Check the following against golden:
+def count_nonzero_prunable_parameters_pytree(x):
+  """ Count the number of non-zero prunable parameters in a pytree,
+  specifically targeting parameters under keys matching a specific keyword.
+  """
+  flattened = jax.tree_util.tree_flatten_with_path(x)[0]
+  def count_nonzero_if_keyword(path, value):
+    if path[-1].key == "mask":
+      return jnp.sum(value, dtype=jnp.float64)
+    else:
+      return 0.0
+  nonzero_counts = [
+      count_nonzero_if_keyword(path, value) for (path, value) in flattened
+  ]
+  return sum(nonzero_counts)
+
+
+def count_prunable_parameters_pytree(x):
+  """ Count the number of prunable parameters in a pytree,
+  specifically targeting parameters under keys matching a specific keyword.
+  """
+  flattened = jax.tree_util.tree_flatten_with_path(x)[0]
+  def count_size_if_keyword(path, value):
+    if path[-1].key == "mask":
+      return value.size * 1.0
+    else:
+      return 0.0
+  total_sizes = [count_size_if_keyword(path, value) for (path, value) in flattened]
+  return sum(total_sizes)

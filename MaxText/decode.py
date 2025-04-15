@@ -14,6 +14,13 @@
 
 """CLI utility for running inference on a single stream"""
 
+# python3 MaxText/decode.py MaxText/configs/base.yml run_name=test-decode model_name=llama2-70m \
+#     steps=50 enable_checkpointing=False \
+#     base_output_directory=$OUTPUT_PATH dataset_path=$DATASET_PATH \
+#     attention=dot_product ici_tensor_parallelism=${ICI_TENSOR_PARALLELISM}
+
+
+
 import jax
 
 import max_utils

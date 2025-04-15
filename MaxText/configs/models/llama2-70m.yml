@@ -1,0 +1,27 @@
+base_emb_dim: 512
+base_num_query_heads: 8
+base_num_kv_heads: 8
+base_mlp_dim: 2048
+base_num_decoder_layers: 6
+head_dim: 64
+mlp_activations: ["silu","linear"]
+vocab_size: 32000
+enable_dropout: False
+logits_via_embedding: False
+normalization_layer_epsilon: 1.0e-5
+decoder_block: "llama2"
+# steps: 26800
+steps: 1230
+eval_interval: 4000
+per_device_batch_size: 64.0 # configured for vf_2x2x1
+# per_device_batch_size: 64.0 # configured for pf_2x2x4
+eval_per_device_batch_size: 64.0
+learning_rate: 0.0064
+warmup_steps_fraction: 0.01
+attention: "dot_product"  # more efficient impl requires 128 head dim.
+sparsity: 0.6
+gmp_start_step: 4100
+gmp_end_step: 16600
+pruning_score: "magnitude"
+pruning_method: "global_gradual"
+pruning_structure: "none"

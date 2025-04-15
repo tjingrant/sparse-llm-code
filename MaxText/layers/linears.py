@@ -45,6 +45,7 @@ NdInitializer = initializers.NdInitializer
 
 nd_dense_init = initializers.nd_dense_init
 bias_init = initializers.default_bias_init
+mask_init = jax.nn.initializers.constant(1.0)
 
 RMSNorm = normalizations.RMSNorm
 Quant = quantizations.AqtQuantization
@@ -143,10 +144,21 @@ class DenseGeneral(nn.Module):
           kernel_in_axis,
           kernel_out_axis,
       )
-    kernel = jnp.asarray(kernel, self.dtype)
+    mask = self.param(
+        "mask",
+        nn.with_logical_partitioning(mask_init, self.kernel_axes),
+        kernel_shape,
+        self.weight_dtype
+    )
+    mask = jnp.asarray(mask, self.dtype)
 
     contract_ind = tuple(range(0, len(axis)))
-    output = compute_dot_general(inputs, kernel, axis, contract_ind)
+
+    # Binarize mask due to weight decay.
+    mask = jnp.where(mask > 0.0, 1.0, 0.0)
+    kernel = jnp.asarray(kernel, self.dtype)
+    sparse_kernel = jnp.multiply(kernel, mask)
+    output = compute_dot_general(inputs, sparse_kernel, axis, contract_ind)
 
     if self.use_bias:
       bias_axes, bias_shape = self.kernel_axes[-len(features) :], kernel_shape[-len(features) :]

@@ -474,3 +474,13 @@ sa_use_fused_bwd_kernel: False
 sa_q_layout: "HEAD_DIM_MINOR"
 sa_k_layout: "HEAD_DIM_MINOR"
 sa_v_layout: "HEAD_DIM_MINOR"
+
+# Pruning
+sparsity: 0.5
+pruning_method: "global_gradual" # gmp
+pruning_structure: "none"
+pruning_score: "magnitude" # magnitude or random
+gmp_pruning_frequency: 100 # steps between weight removal
+gmp_start_step: 300
+gmp_end_step: 800
+do_not_prune_kw: "" # keyword to prevent pruning.
